@@ -32,17 +32,104 @@ const DEFAULT_RECV_TIMEOUT_SEC: Duration = Duration::from_secs(1);
 
 const SUBHEADER_LEN: usize = 15;
 
-macro_rules! invalidDataError {
-    ($msg:expr) => {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, $msg)
-    };
+/// Result alias for fallible [`SLMPClient`] operations.
+pub type SlmpResult<T> = core::result::Result<T, SlmpError>;
+
+/// Structured error type returned by fallible [`SLMPClient`] operations.
+#[derive(Debug)]
+pub enum SlmpError {
+    /// A complete, length-consistent frame arrived but the SLMP end code was
+    /// non-zero: the device rejected this request. Bytes are still aligned to
+    /// request boundaries, so the caller MAY continue on the same connection
+    /// and treat only this request as failed.
+    Device { end_code: u16 },
+    /// The response structure itself is corrupt (bad length / bad fixed field /
+    /// echo mismatch). The byte stream may be desynchronized; the caller SHOULD
+    /// drop the connection.
+    Framing(FramingError),
+    /// A send/receive/connect deadline elapsed.
+    Timeout,
+    /// The stream is not connected.
+    NotConnected,
+    /// Any other transport/IO failure (connection refused, reset, broken pipe,
+    /// EOF, DNS, address resolution, etc.).
+    Io(std::io::Error),
 }
-macro_rules! check {
-    ($data:expr, $idx:expr, $expected:expr, $msg:expr) => {
-        if $data[$idx] != $expected {
-            return Err(invalidDataError!($msg));
+
+/// Describes why a received SLMP response frame is structurally invalid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FramingError {
+    /// Frame shorter than the minimum SLMP 4E response (fixed header + end code).
+    ShortFrame { len: usize, min: usize },
+    /// The declared data-block length disagrees with the bytes actually received.
+    LengthMismatch { declared: usize, actual: usize },
+    /// A fixed header field held an unexpected value.
+    UnexpectedField { field: &'static str },
+    /// An echo response body did not match the payload that was sent.
+    EchoMismatch,
+}
+
+impl std::fmt::Display for SlmpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SlmpError::Device { end_code } => write!(f, "SLMP device error: {} (0x{:04X})", end_code_name(*end_code), end_code),
+            SlmpError::Framing(e) => write!(f, "SLMP framing error: {e}"),
+            SlmpError::Timeout => write!(f, "SLMP operation timed out"),
+            SlmpError::NotConnected => write!(f, "SLMP stream is not connected"),
+            SlmpError::Io(e) => write!(f, "SLMP I/O error: {e}"),
         }
-    };
+    }
+}
+
+impl std::error::Error for SlmpError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            SlmpError::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for FramingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FramingError::ShortFrame { len, min } => write!(f, "response frame too short: got {len} bytes, need at least {min}"),
+            FramingError::LengthMismatch { declared, actual } => write!(f, "declared data length {declared} does not match actual data length {actual}"),
+            FramingError::UnexpectedField { field } => write!(f, "unexpected value in field '{field}'"),
+            FramingError::EchoMismatch => write!(f, "echo response body did not match the payload that was sent"),
+        }
+    }
+}
+
+impl std::error::Error for FramingError {}
+
+impl From<std::io::Error> for SlmpError {
+    fn from(e: std::io::Error) -> Self {
+        match e.kind() {
+            std::io::ErrorKind::TimedOut => SlmpError::Timeout,
+            std::io::ErrorKind::NotConnected => SlmpError::NotConnected,
+            _ => SlmpError::Io(e),
+        }
+    }
+}
+
+/// Returns the symbolic name for a non-zero SLMP end code, or `"Unknown Error"`.
+pub fn end_code_name(code: u16) -> &'static str {
+    match code {
+        0xC059 => "WrongCommand",
+        0xC05C => "WrongFormat",
+        0xC061 => "WrongLength",
+        0xCEE0 => "Busy",
+        0xCEE1 => "ExceedReqLength",
+        0xCEE2 => "ExceedRespLength",
+        0xCF10 => "ServerNotFound",
+        0xCF20 => "WrongConfigItem",
+        0xCF30 => "PrmIDNotFound",
+        0xCF31 => "NotStartExclusiveWrite",
+        0xCF70 => "RelayFailure",
+        0xCF71 => "TimeoutError",
+        _ => "Unknown Error",
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -137,18 +224,17 @@ impl SLMPClient {
         self.recv_timeout = dur;
     }
 
-    pub async fn connect(&self) -> std::io::Result<()> {
+    pub async fn connect(&self) -> SlmpResult<()> {
         self.close().await;
 
         let addr: (&str, u16) = (&self.connection_props.ip, self.connection_props.port);
         let socket_addr: SocketAddr = addr
             .to_socket_addrs()?
             .next()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "resolve failed"))?;
+            .ok_or_else(|| SlmpError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "resolve failed")))?;
 
         let stream: TcpStream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(socket_addr))
-            .await.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut,"Connect Failed (Timeout)"))
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut,"Connect Failed (Timeout)"))??;
+            .await.map_err(|_| SlmpError::Timeout)??;
 
         let mut lock = self.stream.lock().await;
         *lock = Some(stream);
@@ -156,7 +242,7 @@ impl SLMPClient {
         Ok(())
     }
 
-    async fn request_response(&mut self, msg: &[u8]) -> std::io::Result<&[u8]> {
+    async fn request_response(&mut self, msg: &[u8]) -> SlmpResult<&[u8]> {
         const RECVFRAME_PREFIX_FIXED_LEN: usize = 15;
 
         let msg_len: usize = msg.len();
@@ -167,93 +253,87 @@ impl SLMPClient {
         send_msg.extend(msg);
 
         let mut stream = self.stream.lock().await;
-        let stream = stream.as_mut().ok_or(std::io::Error::new(std::io::ErrorKind::NotConnected, "Not Connected"))?;
+        let stream = stream.as_mut().ok_or(SlmpError::NotConnected)?;
 
         timeout(self.send_timeout, stream.write_all(&send_msg)).await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut,"Send Failed (Timeout)"))??;
+            .map_err(|_| SlmpError::Timeout)??;
 
         let bytes_read = timeout(self.recv_timeout, stream.read(&mut self.buffer)).await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut,"Read Failed (Timeout)"))??;
+            .map_err(|_| SlmpError::Timeout)??;
 
         self.validate_response(&self.buffer[..bytes_read])?;
 
         Ok(&self.buffer[RECVFRAME_PREFIX_FIXED_LEN..bytes_read])
     }
 
-    fn validate_response(&self, data: &[u8]) -> std::io::Result<()> {
+    fn validate_response(&self, data: &[u8]) -> SlmpResult<()> {
         const FIXED_FRAME_LEN: usize = 13;
+        const MIN_FRAME_LEN: usize = 15;
         const RESPONSE_CODE: [u8; 2] = [0xD4, 0x00];
         const BLANK_CODE: u8 = 0x00;
 
+        macro_rules! check_field {
+            ($data:expr, $idx:expr, $expected:expr, $field:expr) => {
+                if $data[$idx] != $expected {
+                    return Err(SlmpError::Framing(FramingError::UnexpectedField { field: $field }));
+                }
+            };
+        }
+
         let data_len: usize = data.len();
-        if data_len < FIXED_FRAME_LEN {
-            return Err(invalidDataError!("Received Invalid Length Data"));
+        if data_len < MIN_FRAME_LEN {
+            return Err(SlmpError::Framing(FramingError::ShortFrame { len: data_len, min: MIN_FRAME_LEN }));
         }
 
         let data_block_len: usize = u16::from_le_bytes([data[11], data[12]]) as usize;
         if data_block_len != data_len - FIXED_FRAME_LEN {
-            return Err(invalidDataError!("Received Invalid Data Frame"));
+            return Err(SlmpError::Framing(FramingError::LengthMismatch { declared: data_block_len, actual: data_len - FIXED_FRAME_LEN }));
         }
 
-        let error = u16::from_le_bytes([data[13], data[14]]);
-        if error != 0 {
-            let error_msg = match error {
-                0xC059 => "WrongCommand",
-                0xC05C => "WrongFormat",
-                0xC061 => "WrongLength",
-                0xCEE0 => "Busy",
-                0xCEE1 => "ExceedReqLength",
-                0xCEE2 => "ExceedRespLength",
-                0xCF10 => "ServerNotFound",
-                0xCF20 => "WrongConfigItem",
-                0xCF30 => "PrmIDNotFound",
-                0xCF31 => "NotStartExclusiveWrite",
-                0xCF70 => "RelayFailure",
-                0xCF71 => "TimeoutError",
-                _ => "Unknown Error",
-            };
-            return Err(invalidDataError!(format!("SLMP Returns Error: {error_msg} (0x{error:X})")));
+        let end_code = u16::from_le_bytes([data[13], data[14]]);
+        if end_code != 0 {
+            return Err(SlmpError::Device { end_code });
         }
 
-        check!(data, 0..2, RESPONSE_CODE, "Received Invalid Response Data");
-        check!(data, 2..4, self.connection_props.serial_id.to_le_bytes(), "Received Invalid Serial ID");
-        check!(data, 4..6, [BLANK_CODE; 2], "Received Invalid Blank Code");
-        check!(data, 6, self.connection_props.network_id, "Received Invalid Network ID");
-        check!(data, 7, self.connection_props.pc_id, "Received Invalid PC ID");
-        check!(data, 8..10, self.connection_props.io_id.to_le_bytes(), "Received Invalid IO ID");
-        check!(data,10, self.connection_props.area_id, "Received Invalid Area ID");
+        check_field!(data, 0..2, RESPONSE_CODE, "response_code");
+        check_field!(data, 2..4, self.connection_props.serial_id.to_le_bytes(), "serial_id");
+        check_field!(data, 4..6, [BLANK_CODE; 2], "blank");
+        check_field!(data, 6, self.connection_props.network_id, "network_id");
+        check_field!(data, 7, self.connection_props.pc_id, "pc_id");
+        check_field!(data, 8..10, self.connection_props.io_id.to_le_bytes(), "io_id");
+        check_field!(data, 10, self.connection_props.area_id, "area_id");
 
         Ok(())
     }
 
     /* Unit Control */
 
-    pub async fn run_cpu(&mut self) -> std::io::Result<()> {
+    pub async fn run_cpu(&mut self) -> SlmpResult<()> {
         const COMMAND: [u8; 8] = unit_control::remote_run();
         self.request_response(&COMMAND).await.map(|_| ())
     }
 
-    pub async fn stop_cpu(&mut self) -> std::io::Result<()> {
+    pub async fn stop_cpu(&mut self) -> SlmpResult<()> {
         const COMMAND: [u8; 6] = unit_control::remote_stop();
         self.request_response(&COMMAND).await.map(|_| ())
     }
 
-    pub async fn pause_cpu(&mut self) -> std::io::Result<()> {
+    pub async fn pause_cpu(&mut self) -> SlmpResult<()> {
         const COMMAND: [u8; 6] = unit_control::remote_pause();
         self.request_response(&COMMAND).await.map(|_| ())
     }
 
-    pub async fn clear_latch(&mut self) -> std::io::Result<()> {
+    pub async fn clear_latch(&mut self) -> SlmpResult<()> {
         const COMMAND: [u8; 6] = unit_control::remote_latch_clear();
         self.request_response(&COMMAND).await.map(|_| ())
     }
 
-    pub async fn reset_cpu(&mut self) -> std::io::Result<()> {
+    pub async fn reset_cpu(&mut self) -> SlmpResult<()> {
         const COMMAND: [u8; 6] = unit_control::remote_reset();
         self.request_response(&COMMAND).await.map(|_| ())
     }
 
-    pub async fn get_cpu_type(&mut self) -> std::io::Result<String> {
+    pub async fn get_cpu_type(&mut self) -> SlmpResult<String> {
         const COMMAND: [u8; 4] = unit_control::get_cpu_type();
         let ret = self.request_response(&COMMAND).await?;
 
@@ -264,28 +344,25 @@ impl SLMPClient {
         Ok(cpu_type)
     }
 
-    pub async fn lock_cpu(&mut self, password: &str) -> std::io::Result<()> {
+    pub async fn lock_cpu(&mut self, password: &str) -> SlmpResult<()> {
         let cmd = unit_control::lock_cpu(&self.connection_props.cpu, password)?;
         self.request_response(&cmd).await.map(|_| ())
     }
 
-    pub async fn unlock_cpu(&mut self, password: &str) -> std::io::Result<()> {
+    pub async fn unlock_cpu(&mut self, password: &str) -> SlmpResult<()> {
         let cmd = unit_control::unlock_cpu(&self.connection_props.cpu, password)?;
         self.request_response(&cmd).await.map(|_| ())
     }
 
-    pub async fn echo(&mut self) -> std::io::Result<()> {
+    pub async fn echo(&mut self) -> SlmpResult<()> {
         const COMMAND: [u8; 10] = unit_control::echo();
         let recv = self.request_response(&COMMAND).await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::NetworkDown, "Echo response did not return in time"))?;
+            .map_err(|_| SlmpError::Timeout)?;
 
         if &recv[2..6] ==  unit_control::ECHO_MESSAGE {
             Ok(())
         } else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Echo mismatch, send: {:02x?}, received: {:02x?}", unit_control::ECHO_MESSAGE, &recv[2..6])
-            ))
+            return Err(SlmpError::Framing(FramingError::EchoMismatch))
         }
     }
 
@@ -293,7 +370,7 @@ impl SLMPClient {
 
     /* Device Access */
 
-    pub async fn bulk_write<'a>(&mut self, start_device: Device, data: &'a [TypedData]) -> std::io::Result<()>
+    pub async fn bulk_write<'a>(&mut self, start_device: Device, data: &'a [TypedData]) -> SlmpResult<()>
     {
         if data.len() > 0 {
             let query = SLMPBulkWriteQuery {
@@ -310,7 +387,7 @@ impl SLMPClient {
     }
 
 
-    pub async fn random_write<'a>(&mut self, data: &'a [DeviceData]) -> std::io::Result<()>
+    pub async fn random_write<'a>(&mut self, data: &'a [DeviceData]) -> SlmpResult<()>
     {
         // Word access
         let mut sorted_word_data: Vec<DeviceData> = data.iter()
@@ -379,7 +456,7 @@ impl SLMPClient {
         Ok(())
     }
 
-    pub async fn block_write<'a>(&mut self, data: &'a [BlockedDeviceData<'a>]) -> std::io::Result<()>
+    pub async fn block_write<'a>(&mut self, data: &'a [BlockedDeviceData<'a>]) -> SlmpResult<()>
     {
         let mut sorted_data = data.to_vec();
         sorted_data.sort_by_key(|p| p.access_type);
@@ -402,7 +479,7 @@ impl SLMPClient {
         Ok(())
     }
 
-    pub async fn bulk_read(&mut self, start_device: Device, device_num: usize, data_type: DataType) -> std::io::Result<Vec<DeviceData>>
+    pub async fn bulk_read(&mut self, start_device: Device, device_num: usize, data_type: DataType) -> SlmpResult<Vec<DeviceData>>
     {
         let query = SLMPBulkReadQuery {
             cpu: &self.connection_props.cpu,
@@ -449,7 +526,7 @@ impl SLMPClient {
         }
     }
 
-    pub async fn random_read(&mut self, devices: &[TypedDevice]) -> std::io::Result<Vec<DeviceData>>
+    pub async fn random_read(&mut self, devices: &[TypedDevice]) -> SlmpResult<Vec<DeviceData>>
     {
         let monitor_list = MonitorList::from(devices);
 
@@ -465,7 +542,7 @@ impl SLMPClient {
     }
 
 
-    pub async fn block_read(&mut self, device_blocks: &[DeviceBlock]) -> std::io::Result<Vec<DeviceData>>
+    pub async fn block_read(&mut self, device_blocks: &[DeviceBlock]) -> SlmpResult<Vec<DeviceData>>
     {
         const WORD_RESPONSE_BYTEELEN: usize = 2;
         const BIT_RESPONSE_BYTEELEN: usize = 1;
@@ -530,7 +607,7 @@ impl SLMPClient {
         Ok(ret)
     }
 
-    pub async fn monitor_register(&mut self, devices: &[TypedDevice]) -> std::io::Result<MonitorList>
+    pub async fn monitor_register(&mut self, devices: &[TypedDevice]) -> SlmpResult<MonitorList>
     {
         let monitor_list = MonitorList::from(devices);
         let query = SLMPMonitorRegisterQuery {
@@ -543,7 +620,7 @@ impl SLMPClient {
         Ok(monitor_list)
     }
 
-    pub async fn monitor_read(&mut self, monitor_list: &MonitorList) -> std::io::Result<Vec<DeviceData>>
+    pub async fn monitor_read(&mut self, monitor_list: &MonitorList) -> SlmpResult<Vec<DeviceData>>
     {
         const COMMAND: SLMPMonitorReadCommand = SLMPMonitorReadCommand::new();
         let recv: &[u8] = &(self.request_response(&COMMAND).await?);
@@ -598,4 +675,144 @@ pub(crate) const fn bits_to_u16(bits: [bool; 16]) -> u16 {
     let low_byte = bits_to_u8(low_bits);
 
     u16::from_be_bytes([low_byte, high_byte])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_props() -> SLMP4EConnectionProps {
+        SLMP4EConnectionProps {
+            ip: "127.0.0.1".to_string(),
+            port: 0,
+            cpu: CPU::R,
+            serial_id: 0,
+            network_id: 0,
+            pc_id: 0xFF,
+            io_id: 0x03FF,
+            area_id: 0,
+            cpu_timer: 0,
+        }
+    }
+
+    /// Builds a well-formed SLMP 4E response frame whose fixed fields match
+    /// `props`, with the given end code and payload, and a correctly computed
+    /// data-block-length field.
+    fn build_frame(props: &SLMP4EConnectionProps, end_code: u16, payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[0xD4, 0x00]); // response_code
+        frame.extend_from_slice(&props.serial_id.to_le_bytes());
+        frame.extend_from_slice(&[0x00, 0x00]); // blank
+        frame.push(props.network_id);
+        frame.push(props.pc_id);
+        frame.extend_from_slice(&props.io_id.to_le_bytes());
+        frame.push(props.area_id);
+
+        let data_block_len: u16 = (2 + payload.len()) as u16;
+        frame.extend_from_slice(&data_block_len.to_le_bytes());
+
+        frame.extend_from_slice(&end_code.to_le_bytes());
+        frame.extend_from_slice(payload);
+
+        frame
+    }
+
+    #[test]
+    fn end_code_nonzero_is_device_not_framing() {
+        let props = dummy_props();
+        let client = SLMPClient::new(props.clone());
+        let frame = build_frame(&props, 0xC059, &[]);
+
+        let result = client.validate_response(&frame);
+
+        match result {
+            Err(SlmpError::Device { end_code }) => assert_eq!(end_code, 0xC059),
+            other => panic!("expected Err(SlmpError::Device {{ .. }}), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_frame_is_framing() {
+        let props = dummy_props();
+        let client = SLMPClient::new(props.clone());
+        let mut frame = build_frame(&props, 0, &[]);
+
+        // Declare a data-block length of 10 while only 2 bytes (the end code)
+        // actually follow the fixed header.
+        frame[11..13].copy_from_slice(&10u16.to_le_bytes());
+
+        let result = client.validate_response(&frame);
+
+        match result {
+            Err(SlmpError::Framing(FramingError::LengthMismatch { declared, actual })) => {
+                assert_eq!(declared, 10);
+                assert_eq!(actual, 2);
+            }
+            other => panic!("expected Err(SlmpError::Framing(FramingError::LengthMismatch {{ .. }})), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn short_frame_is_framing_not_panic() {
+        let props = dummy_props();
+        let client = SLMPClient::new(props);
+        let frame = vec![0u8; 13];
+
+        let result = client.validate_response(&frame);
+
+        match result {
+            Err(SlmpError::Framing(FramingError::ShortFrame { len, min })) => {
+                assert_eq!(len, 13);
+                assert_eq!(min, 15);
+            }
+            other => panic!("expected Err(SlmpError::Framing(FramingError::ShortFrame {{ .. }})), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_end_code_ok() {
+        let props = dummy_props();
+        let client = SLMPClient::new(props.clone());
+        let frame = build_frame(&props, 0, &[]);
+
+        let result = client.validate_response(&frame);
+
+        assert!(matches!(result, Ok(())));
+    }
+
+    #[test]
+    fn wrong_fixed_field_is_framing() {
+        let props = dummy_props();
+        let client = SLMPClient::new(props.clone());
+        let mut frame = build_frame(&props, 0, &[]);
+
+        // Corrupt the response code field.
+        frame[0] = 0x00;
+        frame[1] = 0x00;
+
+        let result = client.validate_response(&frame);
+
+        match result {
+            Err(SlmpError::Framing(FramingError::UnexpectedField { field })) => {
+                assert_eq!(field, "response_code");
+            }
+            other => panic!("expected Err(SlmpError::Framing(FramingError::UnexpectedField {{ .. }})), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn io_error_maps_to_variants() {
+        assert!(matches!(
+            SlmpError::from(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+            SlmpError::Timeout
+        ));
+        assert!(matches!(
+            SlmpError::from(std::io::Error::from(std::io::ErrorKind::NotConnected)),
+            SlmpError::NotConnected
+        ));
+        assert!(matches!(
+            SlmpError::from(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+            SlmpError::Io(_)
+        ));
+    }
 }

@@ -74,10 +74,10 @@ impl SLMPConnectionManager {
         }
     }
 
-    pub async fn connect<'a, T, F, Fut>(&self, connection_props: &'a SLMP4EConnectionProps, cyclic_task: F, cycle_ms: u64) -> std::io::Result<()>
+    pub async fn connect<'a, T, F, Fut>(&self, connection_props: &'a SLMP4EConnectionProps, cyclic_task: F, cycle_ms: u64) -> SlmpResult<()>
         where
             F: Fn(Vec<PLCData>) -> Fut + std::marker::Send + 'static,
-            Fut: std::future::Future<Output = std::io::Result<T>> + std::marker::Send,
+            Fut: std::future::Future<Output = SlmpResult<T>> + std::marker::Send,
     {
         let socket_addr: SocketAddr = SocketAddr::try_from(connection_props)?;
 
@@ -150,7 +150,7 @@ impl SLMPConnectionManager {
         Ok(())
     }
 
-    pub async fn disconnect<'a>(&self, connection_props: &'a SLMP4EConnectionProps) -> std::io::Result<bool> {
+    pub async fn disconnect<'a>(&self, connection_props: &'a SLMP4EConnectionProps) -> SlmpResult<bool> {
         let socket_addr: SocketAddr = SocketAddr::try_from(connection_props)?;
 
         let mut map = self.connections.lock().await;
@@ -172,7 +172,7 @@ impl SLMPConnectionManager {
         }
     }
 
-    pub async fn register_monitor_targets<'a>(&self, targets: &'a [MonitorRequest<'a>]) -> std::io::Result<Vec<MonitoredDevice>> {
+    pub async fn register_monitor_targets<'a>(&self, targets: &'a [MonitorRequest<'a>]) -> SlmpResult<Vec<MonitoredDevice>> {
 
         let mut socket_addrs: Vec<SocketAddr> = targets
             .iter()
@@ -186,13 +186,13 @@ impl SLMPConnectionManager {
 
         for socket_addr in &socket_addrs {
             if !map.contains_key(socket_addr) {
-                return Err(std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "Connection not found"))
+                return Err(SlmpError::Io(std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "Connection not found")))
             }
         }
 
         for socket_addr in &socket_addrs {
             let worker = map.get(&socket_addr)
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "Connection not found"))?
+                .ok_or_else(|| SlmpError::Io(std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "Connection not found")))?
                 .clone();
 
             let targets: Vec<TypedDevice> = targets
@@ -225,17 +225,17 @@ impl SLMPConnectionManager {
             .collect()
     }
 
-    pub async fn operate_worker<'a, T, F, Fut>(&self, connection_props: &'a SLMP4EConnectionProps, task: F) -> std::io::Result<T>
+    pub async fn operate_worker<'a, T, F, Fut>(&self, connection_props: &'a SLMP4EConnectionProps, task: F) -> SlmpResult<T>
         where
             F: FnOnce(Arc<Mutex<SLMPClient>>) -> Fut,
-            Fut: std::future::Future<Output = std::io::Result<T>>,
+            Fut: std::future::Future<Output = SlmpResult<T>>,
     {
         let socket_addr: SocketAddr = SocketAddr::try_from(connection_props)?;
 
         let worker = {
             let map = self.connections.lock().await;
             map.get(&socket_addr)
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "Connection not found"))?
+                .ok_or_else(|| SlmpError::Io(std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "Connection not found")))?
                 .clone()
         };
 
