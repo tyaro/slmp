@@ -244,6 +244,7 @@ impl SLMPClient {
 
     async fn request_response(&mut self, msg: &[u8]) -> SlmpResult<&[u8]> {
         const RECVFRAME_PREFIX_FIXED_LEN: usize = 15;
+        const FIXED_FRAME_LEN: usize = 13;
 
         let msg_len: usize = msg.len();
         let subheader: [u8; SUBHEADER_LEN] = create_subheader(&self.connection_props, msg_len);
@@ -258,12 +259,30 @@ impl SLMPClient {
         timeout(self.send_timeout, stream.write_all(&send_msg)).await
             .map_err(|_| SlmpError::Timeout)??;
 
-        let bytes_read = timeout(self.recv_timeout, stream.read(&mut self.buffer)).await
-            .map_err(|_| SlmpError::Timeout)??;
+        // TCP may deliver one response in several segments, so read exactly one
+        // frame: the fixed header (which carries the data-block length), then the
+        // data block. A single deadline bounds the whole receive.
+        let buffer = &mut self.buffer;
+        let frame_len: usize = timeout(self.recv_timeout, async {
+            stream.read_exact(&mut buffer[..FIXED_FRAME_LEN]).await?;
 
-        self.validate_response(&self.buffer[..bytes_read])?;
+            let data_block_len: usize = u16::from_le_bytes([buffer[11], buffer[12]]) as usize;
+            if FIXED_FRAME_LEN + data_block_len > BUFSIZE {
+                return Err(SlmpError::Framing(FramingError::LengthMismatch { declared: data_block_len, actual: BUFSIZE - FIXED_FRAME_LEN }));
+            }
+            // The data block holds at least the 2-byte end code.
+            if data_block_len < 2 {
+                return Err(SlmpError::Framing(FramingError::ShortFrame { len: FIXED_FRAME_LEN + data_block_len, min: RECVFRAME_PREFIX_FIXED_LEN }));
+            }
 
-        Ok(&self.buffer[RECVFRAME_PREFIX_FIXED_LEN..bytes_read])
+            let frame_len: usize = FIXED_FRAME_LEN + data_block_len;
+            stream.read_exact(&mut buffer[FIXED_FRAME_LEN..frame_len]).await?;
+            Ok::<usize, SlmpError>(frame_len)
+        }).await.map_err(|_| SlmpError::Timeout)??;
+
+        self.validate_response(&self.buffer[..frame_len])?;
+
+        Ok(&self.buffer[RECVFRAME_PREFIX_FIXED_LEN..frame_len])
     }
 
     fn validate_response(&self, data: &[u8]) -> SlmpResult<()> {
@@ -814,5 +833,141 @@ mod tests {
             SlmpError::from(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
             SlmpError::Io(_)
         ));
+    }
+
+    // ---- request_response receive-path tests (loopback fake server) ----
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Starts a fake server that accepts one connection, reads the request, and
+    /// hands the socket to `serve`. Returns a connected client.
+    async fn client_with_server<F, Fut>(recv_timeout: Duration, serve: F) -> SLMPClient
+    where
+        F: FnOnce(tokio::net::TcpStream, SLMP4EConnectionProps) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut props = dummy_props();
+        props.port = listener.local_addr().unwrap().port();
+        let server_props = props.clone();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.set_nodelay(true).unwrap();
+            let mut req = [0u8; 256];
+            let _ = sock.read(&mut req).await.unwrap();
+            serve(sock, server_props).await;
+        });
+        let mut client = SLMPClient::new(props);
+        client.set_recv_timeout(recv_timeout);
+        client.connect().await.unwrap();
+        client
+    }
+
+    fn read_d0() -> (Device, usize, DataType) {
+        (Device { device_type: DeviceType::D, address: 0 }, 2, DataType::U16)
+    }
+
+    fn assert_two_words(res: SlmpResult<Vec<DeviceData>>) {
+        let v = res.expect("read should succeed");
+        assert_eq!(v.len(), 2);
+        assert!(matches!(v[0].data, TypedData::U16(0x1234)));
+        assert!(matches!(v[1].data, TypedData::U16(0xABCD)));
+    }
+
+    const WORDS: [u8; 4] = [0x34, 0x12, 0xCD, 0xAB];
+    const SHORT: Duration = Duration::from_millis(20);
+
+    #[tokio::test]
+    async fn recv_full_frame_single_write() {
+        let mut c = client_with_server(Duration::from_secs(2), |mut s, p| async move {
+            s.write_all(&build_frame(&p, 0, &WORDS)).await.unwrap();
+            let _ = s.read(&mut [0u8; 1]).await;
+        }).await;
+        let (d, n, t) = read_d0();
+        assert_two_words(c.bulk_read(d, n, t).await);
+    }
+
+    #[tokio::test]
+    async fn recv_frame_split_in_pieces() {
+        let mut c = client_with_server(Duration::from_secs(2), |mut s, p| async move {
+            let f = build_frame(&p, 0, &WORDS);
+            s.write_all(&f[..1]).await.unwrap();
+            tokio::time::sleep(SHORT).await;
+            s.write_all(&f[1..6]).await.unwrap();
+            tokio::time::sleep(SHORT).await;
+            s.write_all(&f[6..]).await.unwrap();
+            let _ = s.read(&mut [0u8; 1]).await;
+        }).await;
+        let (d, n, t) = read_d0();
+        assert_two_words(c.bulk_read(d, n, t).await);
+    }
+
+    #[tokio::test]
+    async fn recv_header_split_at_length_field() {
+        let mut c = client_with_server(Duration::from_secs(2), |mut s, p| async move {
+            let f = build_frame(&p, 0, &WORDS);
+            s.write_all(&f[..12]).await.unwrap();
+            tokio::time::sleep(SHORT).await;
+            s.write_all(&f[12..]).await.unwrap();
+            let _ = s.read(&mut [0u8; 1]).await;
+        }).await;
+        let (d, n, t) = read_d0();
+        assert_two_words(c.bulk_read(d, n, t).await);
+    }
+
+    #[tokio::test]
+    async fn recv_peer_close_mid_frame_is_connection_level() {
+        let mut c = client_with_server(Duration::from_secs(2), |mut s, p| async move {
+            let f = build_frame(&p, 0, &WORDS);
+            s.write_all(&f[..16]).await.unwrap();
+            // dropping the socket closes it
+        }).await;
+        let (d, n, t) = read_d0();
+        match c.bulk_read(d, n, t).await {
+            Err(SlmpError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof),
+            other => panic!("expected Io(UnexpectedEof), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn recv_oversized_declared_length_is_framing() {
+        let mut c = client_with_server(Duration::from_secs(2), |mut s, p| async move {
+            let mut f = build_frame(&p, 0, &WORDS);
+            f[11..13].copy_from_slice(&((BUFSIZE - 13 + 1) as u16).to_le_bytes());
+            s.write_all(&f).await.unwrap();
+            let _ = s.read(&mut [0u8; 1]).await;
+        }).await;
+        let (d, n, t) = read_d0();
+        assert!(matches!(
+            c.bulk_read(d, n, t).await,
+            Err(SlmpError::Framing(FramingError::LengthMismatch { .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn recv_undersized_declared_length_is_framing() {
+        let mut c = client_with_server(Duration::from_secs(2), |mut s, p| async move {
+            let mut f = build_frame(&p, 0, &[]);
+            f[11..13].copy_from_slice(&1u16.to_le_bytes());
+            s.write_all(&f[..14]).await.unwrap();
+            let _ = s.read(&mut [0u8; 1]).await;
+        }).await;
+        let (d, n, t) = read_d0();
+        assert!(matches!(
+            c.bulk_read(d, n, t).await,
+            Err(SlmpError::Framing(FramingError::ShortFrame { .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn recv_stalled_frame_times_out() {
+        let mut c = client_with_server(Duration::from_millis(150), |mut s, p| async move {
+            let f = build_frame(&p, 0, &WORDS);
+            s.write_all(&f[..13]).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }).await;
+        let (d, n, t) = read_d0();
+        assert!(matches!(c.bulk_read(d, n, t).await, Err(SlmpError::Timeout)));
     }
 }
