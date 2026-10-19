@@ -165,6 +165,10 @@ Additional guarantees:
 - `From<std::io::Error> for SlmpError` maps `ErrorKind::TimedOut -> Timeout` and
   `ErrorKind::NotConnected -> NotConnected`; everything else becomes `Io`.
 
+### Changelog
+- **0.2.1**: A response is now read as exactly one frame even if TCP delivers it in
+  several pieces (previously a split response failed with `FramingError::LengthMismatch`).
+
 ### Migrating from 0.1.x (upstream)
 `0.2.0` is a **breaking change**. Method signatures changed from
 `std::io::Result<T>` to `SlmpResult<T>`. In practice:
